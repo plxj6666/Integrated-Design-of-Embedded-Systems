@@ -57,19 +57,31 @@ float light_value;
 float servoAngle;
 
 // Hot start data structure
-#define HOT_START_FLAG 0x12345678  // Magic number to indicate hot start
+#define HOT_START_FLAG_VALUE              0x12345678  // Magic number for main hot start data
+#define HOT_START_VALIDATION_FLAG_VALUE   0xABCDEF01  // Magic number for validation data
+
 typedef struct {
-    uint32_t hot_start_flag;
-    uint32_t light_value_raw;      // Save light sensor raw data
-    uint32_t marquee_count_saved;  // Save marquee LED count
-    uint32_t buzzer_enabled_saved;    // Change from buzzer_state_saved
-    uint32_t motor_state_saved;    // Save motor state
-    uint32_t checksum;             // Simple checksum for data validation
+    uint32_t hot_start_flag;           // Should be HOT_START_FLAG_VALUE
+    uint32_t light_value_raw;
+    uint32_t marquee_count_saved;
+    uint32_t buzzer_enabled_saved;
+    uint32_t motor_state_saved;
+    uint32_t checksum;
 } HotStartData_t;
 
+typedef struct {
+    uint32_t validation_flag;           // Should be HOT_START_VALIDATION_FLAG_VALUE
+    uint32_t light_value_raw_plus_one;
+    uint32_t marquee_count_saved_plus_one;
+    uint32_t buzzer_enabled_saved_plus_one;
+    uint32_t motor_state_saved_plus_one;
+} HotStartValidationData_t;
+
 // Define the backup register base address for STM32F4
-#define BACKUP_REG_BASE ((uint32_t *)0x40002850)  // STM32F4 backup register base
-HotStartData_t *hot_start_data = (HotStartData_t *)BACKUP_REG_BASE;
+#define BACKUP_REG_BASE_ADDR ((uint32_t *)0x40002850)  // STM32F4 backup register base for HotStartData_t base
+HotStartData_t *hot_start_data = (HotStartData_t *)BACKUP_REG_BASE_ADDR;
+// Place validation data immediately after hot_start_data in backup RAM
+HotStartValidationData_t *hot_start_validation_data = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t));
 
 uint8_t is_hot_start = 0;  // hot start flag
 
@@ -78,6 +90,24 @@ uint8_t is_hot_start = 0;  // hot start flag
 #define ZLG_WRITE_ADDRESS1        0x10 // ZLG7290 Display data write start address
 #define ZLG_WRITE_ADDRESS2        0x11 // ZLG7290 Display data write second byte start address (for specific multi-digit display operations)
 #define countof(a) (sizeof(a) / sizeof(*(a))) // Macro to calculate the number of elements in an array
+
+volatile uint8_t g_key_interrupt_flag = 0;
+uint8_t g_raw_key_value = 0; // Stores the raw key value from ZLG7290
+
+// Default main loop delay
+uint32_t g_main_loop_delay_ms = 50;
+
+// Feature enable flags controlled by keys
+uint8_t g_marquee_logic_enabled = 0; // 0 = disabled, 1 = can be activated by light
+uint8_t g_fan_logic_enabled = 0;     // 0 = disabled, 1 = can be activated by light
+
+// Placeholder Key Codes from ZLG7290 - VERIFY AND REPLACE THESE
+#define KEY_CODE_1    0x1C // Example key code for '1'
+#define KEY_CODE_2    0x1B // Example key code for '2'
+#define KEY_CODE_3    0x1A // Example key code for '3'
+#define KEY_CODE_A    0x19 // Example key code for 'A'
+#define KEY_CODE_B    0x11 // Example key code for 'B'
+#define KEY_CODE_C    0x09 // Example key code for 'C'
 
 uint8_t Tx1_Buffer[8]={0}; // Buffer to store data to be sent to ZLG7290 display
 
@@ -102,6 +132,24 @@ uint8_t marquee_count = 0; // Counter for marquee LED sequence
 
 volatile uint8_t g_buzzer_should_sound = 0; // Flag to control buzzer state
 volatile uint8_t g_buzzer_enabled = 0;      // New flag for continuous buzzer control
+
+// For Execution Sequence Check
+typedef enum {
+    SEQ_STATE_POWER_ON_RESET,       // Initial state after reset
+    SEQ_STATE_HAL_INIT_CALLED,      // After HAL_Init() called in init()
+    SEQ_STATE_SYSCLK_CONFIG_CALLED, // After SystemClock_Config() called in init()
+    SEQ_STATE_MX_PERIPH_INIT_CALLED,// After all MX_..._Init() calls in init()
+    SEQ_STATE_CUSTOM_HAL_INIT_CALLED,// After HAL_TIM_PWM_Start, HAL_ADC_Start_DMA in init()
+    SEQ_STATE_INIT_FN_COMPLETED,    // init() function is about to return
+    SEQ_STATE_MAIN_POST_INIT_FN,    // In main(), immediately after init() returned
+    SEQ_STATE_HOT_COLD_CHECK_COMPLETED, // After check_and_restore_hot_start()
+    SEQ_STATE_COLD_START_PATH_COMPLETED, // After cold start specific initializations
+    SEQ_STATE_HOT_START_PATH_COMPLETED,  // After hot start specific restorations & filter priming
+    SEQ_STATE_PRE_MAIN_LOOP,        // All setup before main while(1) loop is done
+    SEQ_STATE_IN_MAIN_LOOP          // Consistently inside the main while(1) loop
+} ExecutionSequenceState_t;
+
+static volatile ExecutionSequenceState_t g_exec_sequence_state = SEQ_STATE_POWER_ON_RESET;
 /* USER CODE END PV */
 
 // Variables for Moving Average Filter
@@ -124,11 +172,91 @@ void beer_should_sound(void); // Function to control buzzer sound state
 void save_hot_start_state(void); // Function to save hot start state
 uint8_t check_and_restore_hot_start(void); // Function to check and restore hot start state
 float apply_moving_average_filter(float raw_value); // Function to apply moving average filter
+void handle_sequence_error_function(ExecutionSequenceState_t expected, const char* file, int line);
+void ProcessKeyPresses(void);
+uint8_t ReadZLG7290Key(void); // Function to read key from ZLG7290
 /* USER CODE END Private function prototypes -----------------------------------------------*/
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
 
+
+uint8_t ReadZLG7290Key(void) {
+    uint8_t key_buffer[1] = {0}; // Buffer to store the read key value
+    I2C_ZLG7290_Read(&hi2c1, 0x71, ZLG_READ_ADDRESS1, key_buffer, 1);
+    return key_buffer[0];
+}
+
+void ProcessKeyPresses(void) {
+    if (g_key_interrupt_flag) {
+        g_key_interrupt_flag = 0; // Acknowledge this interrupt instance first
+
+        g_raw_key_value = ReadZLG7290Key();
+        // It's important to print the value *after* the debounce and read
+        printf("Raw Key Value (debounced): %#x\r\n", g_raw_key_value);
+
+        // Process only if a valid key (not 0 and not I2C error 0xFF) was read after debounce
+        if (g_raw_key_value != 0 && g_raw_key_value != 0xFF) {
+            switch (g_raw_key_value) {
+                case KEY_CODE_1: // Make sure these KEY_CODE_ defines match your actual debounced values
+                    g_main_loop_delay_ms = 25;
+                    printf("Sample rate set to 500ms delay.\r\n");
+                    break;
+                case KEY_CODE_2:
+                    g_main_loop_delay_ms = 50;
+                    printf("Sample rate set to 750ms delay.\r\n");
+                    break;
+                case KEY_CODE_3:
+                    g_main_loop_delay_ms = 75;
+                    printf("Sample rate set to 1000ms delay.\r\n");
+                    break;
+                case KEY_CODE_A: // Example: if 'A' is 0x19 after debounce
+                    g_marquee_logic_enabled = 1;
+                    printf("Marquee LED logic enabled.\r\n");
+                    break;
+                case KEY_CODE_B: // Example: if 'B' is 0x11 after debounce
+                    g_fan_logic_enabled = 1;
+                    printf("Fan logic enabled.\r\n");
+                    break;
+                case KEY_CODE_C:
+                    g_marquee_logic_enabled = 0;
+                    g_fan_logic_enabled = 0;
+                    Turn_Off_All_Marquee_LEDs(); // Immediately turn off LEDs
+                    DC_Task(0x00);               // Immediately stop fan
+                    printf("Marquee LED and Fan logic disabled.\r\n");
+                    break;
+                default:
+                    printf("Unknown or unhandled key after debounce: %#x\r\n", g_raw_key_value);
+                    // No action for unknown keys
+                    break;
+            }
+        } else if (g_raw_key_value == 0) {
+            // This means that after the debounce delay, ZLG7290 reported no key pressed.
+            // This can happen if the interrupt was due to noise, or a very brief bounce,
+            // or if the key was released during the debounce delay.
+            // printf("Debounced read resulted in 0 (no key/end of bounce).\r\n");
+        } else { // g_raw_key_value == 0xFF
+            printf("I2C Read Error for key after debounce.\r\n");
+        }
+    }
+}
+
+
+void handle_sequence_error_function(ExecutionSequenceState_t expected, const char* file, int line) {
+    printf("FATAL: Execution sequence error! Expected state %d, got %d. File: %s, Line: %d\r\n",
+           (int)expected, (int)g_exec_sequence_state, file, line);
+    // Optional: Attempt to save some critical state before reset, use with caution
+    // save_hot_start_state(); 
+    NVIC_SystemReset(); // Re-initialize by system reset
+}
+
+#define CHECK_SEQUENCE(expected_state) \
+    do { \
+        if (g_exec_sequence_state != expected_state) { \
+            handle_sequence_error_function(expected_state, __FILE__, __LINE__); \
+        } \
+    } while(0)
+    
 float apply_moving_average_filter(float raw_value)
 {
     // Subtract the oldest value from sum
@@ -210,9 +338,9 @@ void save_hot_start_state(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();
     
-    hot_start_data->hot_start_flag = HOT_START_FLAG;
+    // Populate main hot start data
+    hot_start_data->hot_start_flag = HOT_START_FLAG_VALUE;
     
-    // Convert light_value to raw uint32_t for storage
     union {
         float f;
         uint32_t u;
@@ -222,17 +350,20 @@ void save_hot_start_state(void)
     
     hot_start_data->marquee_count_saved = marquee_count;
     hot_start_data->buzzer_enabled_saved = g_buzzer_enabled;
-    
-    // Save motor state based on light_value
     hot_start_data->motor_state_saved = (light_value > 20.0f) ? 1 : 0;
     
-    // Simple checksum for additional validation
     uint32_t checksum = hot_start_data->light_value_raw + 
                        hot_start_data->marquee_count_saved + 
                        hot_start_data->buzzer_enabled_saved + 
                        hot_start_data->motor_state_saved;
-    checksum = ~checksum; // Simple complement checksum
-    hot_start_data->checksum = checksum;
+    hot_start_data->checksum = ~checksum;
+
+    // Populate validation data (+1 for each field)
+    hot_start_validation_data->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
+    hot_start_validation_data->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
+    hot_start_validation_data->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
+    hot_start_validation_data->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
+    hot_start_validation_data->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
     
     HAL_PWR_DisableBkUpAccess();
 }
@@ -242,49 +373,81 @@ uint8_t check_and_restore_hot_start(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();
     
-    if (hot_start_data->hot_start_flag == HOT_START_FLAG) {
-        // Verify checksum first
-        uint32_t calculated_checksum = hot_start_data->light_value_raw + 
-                                     hot_start_data->marquee_count_saved + 
-                                     hot_start_data->buzzer_enabled_saved + 
-                                     hot_start_data->motor_state_saved;
-        calculated_checksum = ~calculated_checksum;
-        
-        if (calculated_checksum != hot_start_data->checksum) {
-            printf("Hot start checksum validation failed\r\n");
-            HAL_PWR_DisableBkUpAccess();
-            return 0; // Treat as cold start
-        }
-        
-        // Hot start detected, restore the state
-        union {
-            float f;
-            uint32_t u;
-        } light_converter;
-        light_converter.u = hot_start_data->light_value_raw;
-        light_value = light_converter.f;
-        
-        marquee_count = hot_start_data->marquee_count_saved;
-        g_buzzer_enabled = hot_start_data->buzzer_enabled_saved;
-        
-        // Restore servo angle
-        servoAngle = light_value * (180.0/33.0);
-        
+    // 1. Check main hot start flag
+    if (hot_start_data->hot_start_flag != HOT_START_FLAG_VALUE) {
+        printf("Hot start main flag invalid or not set.\r\n");
         HAL_PWR_DisableBkUpAccess();
+        return 0; // No valid primary hot start data
+    }
+
+    // 2. Check validation data flag
+    if (hot_start_validation_data->validation_flag != HOT_START_VALIDATION_FLAG_VALUE) {
+        printf("Hot start validation flag invalid or not set.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0; // No valid validation data
+    }
         
-        // Validate the restored data
-        if (!validate_hot_start_data()) {
-            // Data validation failed, reset to safe defaults
-            reset_to_safe_defaults();
-            printf("Hot start data corrupted, using safe defaults\r\n");
-            return 0; // Treat as cold start due to data corruption
-        }
-        
-        return 1; // Hot start with valid data
+    // 3. Verify checksum for main data
+    uint32_t calculated_checksum = hot_start_data->light_value_raw + 
+                                 hot_start_data->marquee_count_saved + 
+                                 hot_start_data->buzzer_enabled_saved + 
+                                 hot_start_data->motor_state_saved;
+    calculated_checksum = ~calculated_checksum;
+    
+    if (calculated_checksum != hot_start_data->checksum) {
+        printf("Hot start checksum validation failed.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0; // Treat as cold start
+    }
+    
+    // 4. Perform the new +1 validation
+    if ((hot_start_data->light_value_raw + 1) != hot_start_validation_data->light_value_raw_plus_one) {
+        printf("Hot start +1 validation failed for light_value_raw.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0;
+    }
+    if ((hot_start_data->marquee_count_saved + 1) != hot_start_validation_data->marquee_count_saved_plus_one) {
+        printf("Hot start +1 validation failed for marquee_count_saved.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0;
+    }
+    if ((hot_start_data->buzzer_enabled_saved + 1) != hot_start_validation_data->buzzer_enabled_saved_plus_one) {
+        printf("Hot start +1 validation failed for buzzer_enabled_saved.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0;
+    }
+    if ((hot_start_data->motor_state_saved + 1) != hot_start_validation_data->motor_state_saved_plus_one) {
+        printf("Hot start +1 validation failed for motor_state_saved.\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0;
+    }
+
+    // All checks passed, restore the state from main hot start data
+    union {
+        float f;
+        uint32_t u;
+    } light_converter;
+    light_converter.u = hot_start_data->light_value_raw;
+    light_value = light_converter.f;
+    
+    marquee_count = hot_start_data->marquee_count_saved;
+    g_buzzer_enabled = hot_start_data->buzzer_enabled_saved;
+    
+    // Restore servo angle (derived from light_value)
+    servoAngle = light_value * (180.0/33.0); 
+
+    // 5. Validate the restored data semantically (existing function)
+    if (!validate_hot_start_data()) {
+        // Data validation failed, reset to safe defaults
+        reset_to_safe_defaults();
+        printf("Hot start data corrupted (semantic validation failed), using safe defaults.\r\n");
+        HAL_PWR_DisableBkUpAccess(); // Ensure access is disabled before returning
+        return 0; // Treat as cold start due to data corruption
     }
     
     HAL_PWR_DisableBkUpAccess();
-    return 0; // no hot start
+    printf("Hot start successful with all validations passed.\r\n");
+    return 1; // Hot start with valid data
 }
 
 void beer_should_sound(void)
@@ -401,91 +564,135 @@ void Turn_Off_All_Marquee_LEDs(void)
 
 /* USER CODE END 0 */
 
-int main(void)
-{
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration----------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+void init() {
+  CHECK_SEQUENCE(SEQ_STATE_POWER_ON_RESET); // init() should be called right after power-on/reset
   HAL_Init();
+  g_exec_sequence_state = SEQ_STATE_HAL_INIT_CALLED;
 
-  /* Configure the system clock */
+  CHECK_SEQUENCE(SEQ_STATE_HAL_INIT_CALLED);
   SystemClock_Config();
+  g_exec_sequence_state = SEQ_STATE_SYSCLK_CONFIG_CALLED;
 
+  CHECK_SEQUENCE(SEQ_STATE_SYSCLK_CONFIG_CALLED);
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_ADC3_Init();
   MX_USART1_UART_Init();
   MX_TIM12_Init(); // init PWM timer
-  /* USER CODE BEGIN 2 */  
-  MX_I2C1_Init();
+  MX_I2C1_Init();  // This is also an MX_ peripheral init
+  g_exec_sequence_state = SEQ_STATE_MX_PERIPH_INIT_CALLED;
+
+  /* USER CODE BEGIN 2 in init() - HAL_TIM_PWM_Start and HAL_ADC_Start_DMA are here */  
+  CHECK_SEQUENCE(SEQ_STATE_MX_PERIPH_INIT_CALLED);
+  HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
+  HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
+  g_exec_sequence_state = SEQ_STATE_CUSTOM_HAL_INIT_CALLED;
   
+  CHECK_SEQUENCE(SEQ_STATE_CUSTOM_HAL_INIT_CALLED); // Final check before init() returns
+  g_exec_sequence_state = SEQ_STATE_INIT_FN_COMPLETED;
+}
+
+int main(void)
+{
+  // g_exec_sequence_state is SEQ_STATE_POWER_ON_RESET by default (global static variable)
+
+  /* MCU Configuration----------------------------------------------------------*/
+  init(); // This function will internally check and update g_exec_sequence_state
+  CHECK_SEQUENCE(SEQ_STATE_INIT_FN_COMPLETED); // Verify init() completed its sequence
+  g_exec_sequence_state = SEQ_STATE_MAIN_POST_INIT_FN;
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   // Check if it's a hot start
+  CHECK_SEQUENCE(SEQ_STATE_MAIN_POST_INIT_FN);
   is_hot_start = check_and_restore_hot_start();
-  
+  // check_and_restore_hot_start might also have internal sequence checks if it becomes complex
+  g_exec_sequence_state = SEQ_STATE_HOT_COLD_CHECK_COMPLETED;
+  Turn_Off_All_Marquee_LEDs();
+  DC_Task(0x00);
+  g_marquee_logic_enabled = 0; // Explicitly set to off at start
+  g_fan_logic_enabled = 0;     // Explicitly set to off at start
+
   if (!is_hot_start) {
+      CHECK_SEQUENCE(SEQ_STATE_HOT_COLD_CHECK_COMPLETED);
       // Cold start: normal initialization
-      HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
       Turn_Off_All_Marquee_LEDs(); // Ensure marquee LEDs are off at startup
       printf("Cold start detected\r\n");
       for(int i=0; i<FILTER_WINDOW_SIZE; ++i) light_value_history[i] = 0.0f;
       current_sum = 0.0f;
       filter_index = 0;
       num_samples_in_filter = 0;
+      temp1 = 0;
+      light_value = 0;
+      servoAngle = 0.0;
+      g_exec_sequence_state = SEQ_STATE_COLD_START_PATH_COMPLETED;
   } else {
-      // Hot start: quickly restore state
-      HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Still need to start ADC
-      
-      // Restore device states based on saved state
+      CHECK_SEQUENCE(SEQ_STATE_HOT_COLD_CHECK_COMPLETED);
+      // Hot start: Restore device states based on saved state
       if (light_value > 20.0f) {
-          // Restore marquee LED state
           Turn_Off_All_Marquee_LEDs();
           Turn_On_Marquee_LED(marquee_count % 4);
-          // Restore motor state
           DC_Task(0x13);
       } else {
           Turn_Off_All_Marquee_LEDs();
           DC_Task(0x00);
       }
-      
-      // Restore servo position
       SteeringEngine_Rotate(servoAngle);
-      
+      // Filter priming for hot start:
+      for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
+          light_value_history[i] = light_value;
+      }
+      current_sum = light_value * FILTER_WINDOW_SIZE;
+      num_samples_in_filter = FILTER_WINDOW_SIZE;
+      filter_index = 0;
       printf("Hot start detected, light_value=%.2f\r\n", light_value);
+      g_exec_sequence_state = SEQ_STATE_HOT_START_PATH_COMPLETED;
   }
+  /* USER CODE END 2 */
   
-    /* USER CODE END 2 */
-  HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
-  
-  if (!is_hot_start && num_samples_in_filter == 0) {
-      SteeringEngine_RotateFullCircle(); // Only execute full circle rotation on cold start
+  // Check if one of the paths (cold or hot start) was completed
+  if (g_exec_sequence_state == SEQ_STATE_COLD_START_PATH_COMPLETED) {
+      if (num_samples_in_filter == 0) // This condition is part of cold start path logic
+          SteeringEngine_RotateFullCircle(); // Only execute full circle rotation on cold start
+  } else if (g_exec_sequence_state == SEQ_STATE_HOT_START_PATH_COMPLETED) {
+      // Any specific actions after hot start path completed, if necessary
+  } else {
+      // Neither path completed, this indicates a flaw in the if/else logic or sequence update
+      handle_sequence_error_function(SEQ_STATE_COLD_START_PATH_COMPLETED, __FILE__, __LINE__); // Expected one of the completed path states
   }
+  g_exec_sequence_state = SEQ_STATE_PRE_MAIN_LOOP;
+
 
   while (1)
   {
-  /* USER CODE END WHILE */
-  float raw_light_value_scaled;
-  /* USER CODE BEGIN 3 */    
-  if (!is_hot_start) {
+    /* USER CODE END WHILE */ // This comment seems misplaced, usually before while(1)
+    
+    // Check sequence at the beginning of the loop
+    if (g_exec_sequence_state == SEQ_STATE_PRE_MAIN_LOOP) { // First iteration
+        g_exec_sequence_state = SEQ_STATE_IN_MAIN_LOOP;
+    } else {
+        CHECK_SEQUENCE(SEQ_STATE_IN_MAIN_LOOP); // Subsequent iterations
+    }
+
+    /* USER CODE BEGIN 3 */    
+    ProcessKeyPresses(); // Check for and handle key presses
+
+    if (!is_hot_start) { // This 'is_hot_start' check in the loop might need re-evaluation
+                         // It's usually cleared after the first iteration post-hot-start.
+                         // Assuming it's correctly managed.
         // Normal operation mode: read ADC values
         temp0 = (float)adcx[0]*(3.3/4096); // ADC Channel 0
         temp1 = (float)adcx[1]*(3.3/4096); // ADC Channel 1 (e.g., light sensor)
         temp2 = (float)adcx[2]*(3.3/4096); // ADC Channel 2
         temp3 = (float)adcx[3]*(3.3/4096); // ADC Channel 3
-        raw_light_value_scaled = temp1*10; // Scale light sensor value (example scaling)
+        float raw_light_value_scaled = temp1*10; // Scale light sensor value (example scaling)
 
         // Apply moving average filter
         light_value = apply_moving_average_filter(raw_light_value_scaled);
-
-        servoAngle = light_value * (180.0/33.0); // function to getangle
+        servoAngle = light_value * (180.0/33.0);
     } else {
-        // First loop after hot start, use saved values, then switch to normal mode
-                // Prime the filter with the restored light_value for a smooth transition.
+        // This block is for the first iteration after a hot start.
+        // Prime the filter with the restored light_value for a smooth transition.
         for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
             light_value_history[i] = light_value; // Use the restored light_value
         }
@@ -504,32 +711,40 @@ int main(void)
     // Write data from Tx1_Buffer to ZLG7290 display via I2C
     I2C_ZLG7290_Write(&hi2c1, 0x70, ZLG_WRITE_ADDRESS1, Tx1_Buffer, 8);
     SteeringEngine_Rotate(servoAngle); // Rotate steering engine based on light value
-      // Marquee LED control based on light_value
-    // Note: Sensor value is opposite to actual light intensity
-    if (light_value > 20.0f)  // Actually a dark environment
-    {
-        Turn_Off_All_Marquee_LEDs(); // Turn off all LEDs before lighting the next one in sequence
-        Turn_On_Marquee_LED(marquee_count % 4); // Turn on the current LED in sequence
-        marquee_count++; // Move to the next LED for the next cycle
-        g_buzzer_enabled = 1; // Enable buzzer sound
-        DC_Task(0x13); // Rotate DC motor (example command)    
+
+    // Marquee LED control
+    if (g_marquee_logic_enabled && light_value > 20.0f) {
+        Turn_Off_All_Marquee_LEDs();
+        Turn_On_Marquee_LED(marquee_count % 4);
+        marquee_count++;
+    } else {
+        Turn_Off_All_Marquee_LEDs(); // Off if logic disabled or light <= 20
     }
-    else  // Actually a bright environment
-    {
-        Turn_Off_All_Marquee_LEDs(); // Turn off all marquee LEDs if light value is not greater than 20
-        g_buzzer_enabled = 0; // Stop any ongoing/scheduled beep immediately
-        DC_Task(0x00); // Stop DC motor (example command)
-    }    // Save state periodically (every few cycles)
+
+    // Fan (DC Motor) control
+    if (g_fan_logic_enabled && light_value > 20.0f) {
+        DC_Task(0x13); // Rotate DC motor
+    } else {
+        DC_Task(0x00); // Stop DC motor if logic disabled or light <= 20
+    }
+    
+    // Buzzer control (remains independent of new key flags for now)
+    if (light_value > 20.0f) { // Actually a dark environment
+        g_buzzer_enabled = 1;
+    } else { // Actually a bright environment
+        g_buzzer_enabled = 0;
+    }
+    
     static uint8_t save_counter = 0;
-    if (++save_counter >= 5) { // Save once every 5 cycles
+    if (++save_counter >= 5) {
         save_hot_start_state();
         save_counter = 0;
     }
 
-    HAL_Delay(500); // Delay for 1 second
+    CHECK_SEQUENCE(SEQ_STATE_IN_MAIN_LOOP);
+    HAL_Delay(g_main_loop_delay_ms); // Use variable delay
   }
   /* USER CODE END 3 */
-
 }
 
 /** System Clock Configuration
@@ -573,6 +788,19 @@ int fputc(int ch, FILE *f)
     USART1->DR = (uint8_t) ch;      
     return ch;
 }
+
+// HAL_GPIO_EXTI_Callback function
+// This function will be called when any EXTI line interrupt occurs.
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == GPIO_PIN_13) // Check for PD13
+  {
+    g_key_interrupt_flag = 1;
+  }
+  // If you have other EXTI sources, handle them here too
+  // else if (GPIO_Pin == OTHER_PIN) { ... }
+}
+
 /* USER CODE END 4 */
 
 #ifdef USE_FULL_ASSERT
