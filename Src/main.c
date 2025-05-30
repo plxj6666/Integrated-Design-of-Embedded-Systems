@@ -43,6 +43,7 @@
 #include "Dc_motor.h"
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "stm32f4xx_hal_iwdg.h"
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -62,29 +63,28 @@ float servoAngle;
 
 typedef struct {
     uint32_t hot_start_flag;           // Should be HOT_START_FLAG_VALUE
-    uint32_t light_value_raw;
-    uint32_t marquee_count_saved;
-    uint32_t buzzer_enabled_saved;
-    uint32_t motor_state_saved;
-    uint32_t checksum;
-} HotStartData_t;
+    uint32_t light_value_raw;          // Raw light value (float converted to uint32_t)
+    uint32_t packed_states;            // Holds marquee_count, buzzer_enabled, motor_state, main_loop_delay
+    uint32_t checksum;                 // Checksum for hot_start_flag, light_value_raw, packed_states
+} __attribute__((packed)) __attribute__((aligned(4))) HotStartData_t; // Size: 4 * sizeof(uint32_t) = 16 bytes
 
 typedef struct {
     uint32_t validation_flag;           // Should be HOT_START_VALIDATION_FLAG_VALUE
     uint32_t light_value_raw_plus_one;
-    uint32_t marquee_count_saved_plus_one;
-    uint32_t buzzer_enabled_saved_plus_one;
-    uint32_t motor_state_saved_plus_one;
-} HotStartValidationData_t;
+    uint32_t packed_states_plus_one;    // Packed data with each original field incremented by 1
+    uint32_t checksum;                  // Checksum for validation_flag, light_value_raw_plus_one, packed_states_plus_one
+} __attribute__((packed)) __attribute__((aligned(4))) HotStartValidationData_t; // Size: 4 * sizeof(uint32_t) = 16 bytes
 
-// Define the backup register base address for STM32F4
-#define BACKUP_REG_BASE_ADDR ((uint32_t *)0x40002850)  // STM32F4 backup register base for HotStartData_t base
-HotStartData_t *hot_start_data = (HotStartData_t *)BACKUP_REG_BASE_ADDR;
+// STM32F4备份寄存器的正确基地址
+#define BACKUP_REG_BASE_ADDR ((uint32_t *)0x40002850)  // 如果这是RTC备份寄存器
 
-// Place validation data immediately after hot_start_data in backup RAM
-HotStartValidationData_t *hot_start_validation_data_1 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t));
-HotStartValidationData_t *hot_start_validation_data_2 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t) + sizeof(HotStartValidationData_t));
-HotStartValidationData_t *hot_start_validation_data_3 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t) + sizeof(HotStartValidationData_t) + sizeof(HotStartValidationData_t));
+#define hot_start_data ((volatile HotStartData_t *)BACKUP_REG_BASE_ADDR)
+// sizeof(HotStartData_t) is 16 bytes (4 uint32_t words)
+// Offsets are in terms of uint32_t* pointer arithmetic
+#define hot_start_data ((volatile HotStartData_t *)BACKUP_REG_BASE_ADDR)
+#define hot_start_validation_data_1 ((volatile HotStartValidationData_t *)(BACKUP_REG_BASE_ADDR + 4))
+#define hot_start_validation_data_2 ((volatile HotStartValidationData_t *)(BACKUP_REG_BASE_ADDR + 8))
+#define hot_start_validation_data_3 ((volatile HotStartValidationData_t *)(BACKUP_REG_BASE_ADDR + 12))
 
 uint8_t is_hot_start = 0;  // hot start flag
 
@@ -132,7 +132,7 @@ const uint8_t segment_codes[10] = { // Segment codes for digits 0-9 for ZLG7290 
 #define SEG_BLANK 0x00  // Segment code for blank/off
 
 uint8_t marquee_count = 0; // Counter for marquee LED sequence
-
+uint8_t gear = 2; // Current gear state (1-3, 0 = off)
 volatile uint8_t g_buzzer_should_sound = 0; // Flag to control buzzer state
 volatile uint8_t g_buzzer_enabled = 0;      // New flag for continuous buzzer control
 
@@ -154,6 +154,9 @@ typedef enum {
 
 static volatile ExecutionSequenceState_t g_exec_sequence_state = SEQ_STATE_POWER_ON_RESET;
 /* USER CODE END PV */
+IWDG_HandleTypeDef hiwdg;
+static uint32_t g_watchdog_feed_counter = 0;
+#define WATCHDOG_FEED_INTERVAL 100  // 每30次主循环喂一次狗
 
 // Variables for Moving Average Filter
 #define FILTER_WINDOW_SIZE 10 // Size of the moving average window (e.g., 10 samples)
@@ -178,11 +181,60 @@ float apply_moving_average_filter(float raw_value); // Function to apply moving 
 void handle_sequence_error_function(ExecutionSequenceState_t expected, const char* file, int line);
 void ProcessKeyPresses(void);
 uint8_t ReadZLG7290Key(void); // Function to read key from ZLG7290
+
+void MX_IWDG_Init(void);
+void Watchdog_Feed(void);
+void Error_Handler(void);
 /* USER CODE END Private function prototypes -----------------------------------------------*/
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+void MX_IWDG_Init(void)
+{
+  /* USER CODE BEGIN IWDG_Init 0 */
 
+  /* USER CODE END IWDG_Init 0 */
+
+  /* USER CODE BEGIN IWDG_Init 1 */
+
+  /* USER CODE END IWDG_Init 1 */
+  hiwdg.Instance = IWDG;
+  hiwdg.Init.Prescaler = IWDG_PRESCALER_256;    // 分频系数64
+  hiwdg.Init.Reload = 625;                     // 重载值625
+  // 超时时间 = (4 * Prescaler * Reload) / LSI_Freq
+  // LSI大约32kHz，所以超时时间 ≈ (256 * 64 * 625) / 32000 ≈ 20秒
+  if (HAL_IWDG_Init(&hiwdg) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG_Init 2 */
+  printf("Watchdog initialized with 5 second timeout\r\n");
+  /* USER CODE END IWDG_Init 2 */
+}
+
+/**
+  * @brief Feed the watchdog
+  * @param None
+  * @retval None
+  */
+void Watchdog_Feed(void)
+{
+  HAL_IWDG_Refresh(&hiwdg);
+  // printf("Watchdog fed\r\n");  // 可选：打印喂狗信息，但会增加串口输出
+}
+
+// Error handler function
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  printf("Error: System error occurred, entering infinite loop\r\n");
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+  while (1)
+  {
+  }
+  /* USER CODE END Error_Handler_Debug */
+}
 
 uint8_t ReadZLG7290Key(void) {
     uint8_t key_buffer[1] = {0}; // Buffer to store the read key value
@@ -282,48 +334,6 @@ float apply_moving_average_filter(float raw_value)
     }
 }
 
-// Data validation function for hot start recovery
-uint8_t validate_hot_start_data(void)
-{
-    // Validate light sensor value range (10-30 based on experiments)
-    if (light_value < 5.0f || light_value > 35.0f) {
-        printf("Hot start data validation failed: light_value=%.2f out of range\r\n", light_value);
-        return 0; // Validation failed
-    }
-    
-    // Validate servo angle range (0-180 degrees)
-    if (servoAngle < 0.0f || servoAngle > 180.0f) {
-        printf("Hot start data validation failed: servoAngle=%.2f out of range\r\n", servoAngle);
-        return 0; // Validation failed
-    }
-    
-    // Validate marquee count range (0-255, but typically 0-3 for LED index)
-    if (marquee_count > 100) { // Allow some flexibility
-        printf("Hot start data validation failed: marquee_count=%d out of range\r\n", marquee_count);
-        return 0; // Validation failed
-    }
-    
-    // Validate buzzer state (should be reasonable) - check g_buzzer_enabled instead
-    if (g_buzzer_enabled > 1) { // Should be 0 or 1
-        printf("Hot start data validation failed: buzzer_enabled=%d out of range\r\n", g_buzzer_enabled);
-        return 0; // Validation failed
-    }
-    
-    // Additional consistency check: servo angle should match light value
-    float expected_servo_angle = light_value * (180.0/33.0);
-    float angle_difference = (servoAngle > expected_servo_angle) ? 
-                            (servoAngle - expected_servo_angle) : 
-                            (expected_servo_angle - servoAngle);
-    
-    if (angle_difference > 10.0f) { // Allow 10 degree tolerance
-        printf("Hot start data validation failed: servo angle inconsistent with light value\r\n");
-        return 0; // Validation failed
-    }
-    
-    printf("Hot start data validation passed\r\n");
-    return 1; // Validation passed
-}
-
 // Reset to safe default values when validation fails
 void reset_to_safe_defaults(void)
 {
@@ -331,8 +341,9 @@ void reset_to_safe_defaults(void)
     servoAngle = 15.0f * (180.0/33.0);
     marquee_count = 0;
     g_buzzer_enabled = 0;   // Changed from g_buzzer_should_sound
+    g_main_loop_delay_ms = 50;  // 设置为默认档位2
     
-    printf("Reset to safe default values\r\n");
+    printf("Reset to safe default values (delay: %lu ms)\r\n", g_main_loop_delay_ms);
 }
 
 void save_hot_start_state(void)
@@ -351,35 +362,59 @@ void save_hot_start_state(void)
     light_converter.f = light_value;
     hot_start_data->light_value_raw = light_converter.u;
     
-    hot_start_data->marquee_count_saved = marquee_count;
-    hot_start_data->buzzer_enabled_saved = g_buzzer_enabled;
-    hot_start_data->motor_state_saved = (light_value > 20.0f) ? 1 : 0;
-    
-    uint32_t checksum = hot_start_data->light_value_raw + 
-                       hot_start_data->marquee_count_saved + 
-                       hot_start_data->buzzer_enabled_saved + 
-                       hot_start_data->motor_state_saved;
-    hot_start_data->checksum = ~checksum;
+    uint8_t mc_save = marquee_count;
+    uint8_t be_save = g_buzzer_enabled ? 1 : 0;
+    uint8_t ms_save = (light_value > 20.0f) ? 1 : 0; // Example motor state logic
+    uint8_t mld_save = (uint8_t)g_main_loop_delay_ms;
 
-    // Populate validation data (+1 for each field)
+    hot_start_data->packed_states = (mc_save & 0xFFU) |          // Bits 0-7
+                                    ((be_save & 0x01U) << 8) |   // Bit 8
+                                    ((ms_save & 0x01U) << 9) |   // Bit 9
+                                    ((mld_save & 0xFFU) << 10);  // Bits 10-17
+    
+    uint32_t checksum_payload = hot_start_data->hot_start_flag + 
+                                hot_start_data->light_value_raw + 
+                                hot_start_data->packed_states;
+    hot_start_data->checksum = ~checksum_payload;
+
+    // Populate validation data (+1 for each field, then pack)
+    uint16_t mc_save_p1 = mc_save + 1;
+    uint8_t be_save_p1 = be_save + 1;
+    uint8_t ms_save_p1 = ms_save + 1;
+    uint16_t mld_save_p1 = mld_save + 1;
+
+    uint32_t packed_plus_one_value = (mc_save_p1 & 0x1FFU) |         // Bits 0-8
+                                     ((be_save_p1 & 0x03U) << 9) |   // Bits 9-10
+                                     ((ms_save_p1 & 0x03U) << 11) |  // Bits 11-12
+                                     ((mld_save_p1 & 0x1FFU) << 13); // Bits 13-21
+
+    // Validation Set 1
     hot_start_validation_data_1->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
     hot_start_validation_data_1->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
-    hot_start_validation_data_1->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
-    hot_start_validation_data_1->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
-    hot_start_validation_data_1->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
-    // Populate validation data 2 (+1 for each field)
+    hot_start_validation_data_1->packed_states_plus_one = packed_plus_one_value;
+    uint32_t checksum_payload_val1 = hot_start_validation_data_1->validation_flag +
+                                     hot_start_validation_data_1->light_value_raw_plus_one +
+                                     hot_start_validation_data_1->packed_states_plus_one;
+    hot_start_validation_data_1->checksum = ~checksum_payload_val1;
+
+    // Validation Set 2
     hot_start_validation_data_2->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
     hot_start_validation_data_2->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
-    hot_start_validation_data_2->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
-    hot_start_validation_data_2->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
-    hot_start_validation_data_2->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
-
-    // Populate validation data 3 (+1 for each field)
+    hot_start_validation_data_2->packed_states_plus_one = packed_plus_one_value;
+    uint32_t checksum_payload_val2 = hot_start_validation_data_2->validation_flag +
+                                     hot_start_validation_data_2->light_value_raw_plus_one +
+                                     hot_start_validation_data_2->packed_states_plus_one;
+    hot_start_validation_data_2->checksum = ~checksum_payload_val2;
+    
+    // Validation Set 3
     hot_start_validation_data_3->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
     hot_start_validation_data_3->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
-    hot_start_validation_data_3->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
-    hot_start_validation_data_3->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
-    hot_start_validation_data_3->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
+    hot_start_validation_data_3->packed_states_plus_one = packed_plus_one_value;
+    uint32_t checksum_payload_val3 = hot_start_validation_data_3->validation_flag +
+                                     hot_start_validation_data_3->light_value_raw_plus_one +
+                                     hot_start_validation_data_3->packed_states_plus_one;
+    hot_start_validation_data_3->checksum = ~checksum_payload_val3;
+
     HAL_PWR_DisableBkUpAccess();
 }
 
@@ -388,84 +423,71 @@ uint8_t check_and_restore_hot_start(void)
     __HAL_RCC_PWR_CLK_ENABLE();
     HAL_PWR_EnableBkUpAccess();
     
-    // 1. Check main hot start flag
-    if (hot_start_data->hot_start_flag != HOT_START_FLAG_VALUE) {
-        printf("Hot start main flag invalid or not set.\r\n");
+    // 1. Check main hot start flag and its checksum
+    uint32_t expected_main_checksum_payload = hot_start_data->hot_start_flag +
+                                              hot_start_data->light_value_raw +
+                                              hot_start_data->packed_states;
+    if (hot_start_data->hot_start_flag != HOT_START_FLAG_VALUE ||
+        hot_start_data->checksum != ~expected_main_checksum_payload) {
+        printf("Hot start main flag or checksum invalid.\r\n");
         HAL_PWR_DisableBkUpAccess();
         return 0; // No valid primary hot start data
     }
         
-    // 2. Verify checksum for main data
-    uint32_t calculated_checksum = hot_start_data->light_value_raw + 
-                                 hot_start_data->marquee_count_saved + 
-                                 hot_start_data->buzzer_enabled_saved + 
-                                 hot_start_data->motor_state_saved;
-    calculated_checksum = ~calculated_checksum;
-    
-    if (calculated_checksum != hot_start_data->checksum) {
-        printf("Hot start checksum validation failed for main data.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0; // Treat as cold start
-    }
-    
     uint8_t successful_validations = 0;
+    volatile HotStartValidationData_t* validation_sets[] = {
+        hot_start_validation_data_1,
+        hot_start_validation_data_2,
+        hot_start_validation_data_3
+    };
 
-    // 3. Perform validation for backup set 1
-    if (hot_start_validation_data_1->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
-        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_1->light_value_raw_plus_one &&
-            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_1->marquee_count_saved_plus_one &&
-            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_1->buzzer_enabled_saved_plus_one &&
-            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_1->motor_state_saved_plus_one) {
-            successful_validations++;
-            printf("Validation set 1 passed.\r\n");
-        } else {
-            printf("Validation set 1: +1 data mismatch.\r\n");
-        }
-    } else {
-        printf("Validation set 1: flag invalid.\r\n");
-    }
+    for (int i = 0; i < 3; ++i) {
+        volatile HotStartValidationData_t* current_val_set = validation_sets[i];
+        uint32_t expected_val_checksum_payload = current_val_set->validation_flag +
+                                                 current_val_set->light_value_raw_plus_one +
+                                                 current_val_set->packed_states_plus_one;
+        if (current_val_set->validation_flag == HOT_START_VALIDATION_FLAG_VALUE &&
+            current_val_set->checksum == ~expected_val_checksum_payload) {
+            
+            // Check data consistency (+1 relationship)
+            uint8_t mc_orig = (uint8_t)(hot_start_data->packed_states & 0xFFU);
+            uint8_t be_orig = (uint8_t)((hot_start_data->packed_states >> 8) & 0x01U);
+            uint8_t ms_orig = (uint8_t)((hot_start_data->packed_states >> 9) & 0x01U);
+            uint8_t mld_orig = (uint8_t)((hot_start_data->packed_states >> 10) & 0xFFU);
 
-    // 4. Perform validation for backup set 2
-    if (hot_start_validation_data_2->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
-        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_2->light_value_raw_plus_one &&
-            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_2->marquee_count_saved_plus_one &&
-            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_2->buzzer_enabled_saved_plus_one &&
-            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_2->motor_state_saved_plus_one) {
-            successful_validations++;
-            printf("Validation set 2 passed.\r\n");
-        } else {
-            printf("Validation set 2: +1 data mismatch.\r\n");
-        }
-    } else {
-        printf("Validation set 2: flag invalid.\r\n");
-    }
+            uint16_t mc_orig_p1 = mc_orig + 1;
+            uint8_t be_orig_p1 = be_orig + 1;
+            uint8_t ms_orig_p1 = ms_orig + 1;
+            uint16_t mld_orig_p1 = mld_orig + 1;
 
-    // 5. Perform validation for backup set 3
-    if (hot_start_validation_data_3->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
-        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_3->light_value_raw_plus_one &&
-            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_3->marquee_count_saved_plus_one &&
-            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_3->buzzer_enabled_saved_plus_one &&
-            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_3->motor_state_saved_plus_one) {
-            successful_validations++;
-            printf("Validation set 3 passed.\r\n");
+            uint32_t expected_packed_plus_one = (mc_orig_p1 & 0x1FFU) |
+                                                ((be_orig_p1 & 0x03U) << 9) |
+                                                ((ms_orig_p1 & 0x03U) << 11) |
+                                                ((mld_orig_p1 & 0x1FFU) << 13);
+            
+            if ((hot_start_data->light_value_raw + 1) == current_val_set->light_value_raw_plus_one &&
+                expected_packed_plus_one == current_val_set->packed_states_plus_one) {
+                successful_validations++;
+                printf("Validation set %d passed (checksum + data consistency).\r\n", i + 1);
+            } else {
+                printf("Validation set %d: +1 data mismatch.\r\n", i + 1);
+            }
         } else {
-            printf("Validation set 3: +1 data mismatch.\r\n");
+            printf("Validation set %d: flag or checksum invalid.\r\n", i + 1);
         }
-    } else {
-        printf("Validation set 3: flag invalid.\r\n");
     }
 
     printf("Total successful backup validations: %d\r\n", successful_validations);
 
     // 6. Majority Vote
-    if (successful_validations < 2) {
+    if (successful_validations < 2) { // Need at least 2 out of 3 for majority
         printf("Hot start majority vote failed (need at least 2 valid backup sets).\r\n");
         HAL_PWR_DisableBkUpAccess();
         return 0; // Treat as cold start
     }
     printf("Hot start majority vote passed.\r\n");
 
-    // All primary checks and majority vote passed, restore the state from main hot start data
+    // All primary checks and majority vote passed, restore the state
     union {
         float f;
         uint32_t u;
@@ -473,23 +495,16 @@ uint8_t check_and_restore_hot_start(void)
     light_converter.u = hot_start_data->light_value_raw;
     light_value = light_converter.f;
     
-    marquee_count = hot_start_data->marquee_count_saved;
-    g_buzzer_enabled = hot_start_data->buzzer_enabled_saved;
+    uint32_t temp_packed_states = hot_start_data->packed_states;
+    marquee_count = (uint8_t)(temp_packed_states & 0xFFU);
+    g_buzzer_enabled = (uint8_t)((temp_packed_states >> 8) & 0x01U);
+    // motor_state is implicitly restored by light_value logic later or not directly restored as a global
+    g_main_loop_delay_ms = (uint32_t)((temp_packed_states >> 10) & 0xFFU);
     
-    // Restore servo angle (derived from light_value)
-    servoAngle = light_value * (180.0/33.0); 
+    servoAngle = light_value * (180.0f/33.0f); 
 
-    // 7. Validate the restored data semantically (existing function)
-    if (!validate_hot_start_data()) {
-        // Data validation failed, reset to safe defaults
-        reset_to_safe_defaults();
-        printf("Hot start data corrupted (semantic validation failed), using safe defaults.\r\n");
-        HAL_PWR_DisableBkUpAccess(); // Ensure access is disabled before returning
-        return 0; // Treat as cold start due to data corruption
-    }
-    
     HAL_PWR_DisableBkUpAccess();
-    printf("Hot start successful with all validations passed.\r\n");
+    printf("Hot start successful. Restored delay: %lu ms, Light: %.2f\r\n", g_main_loop_delay_ms, light_value);
     return 1; // Hot start with valid data
 }
 
@@ -541,13 +556,17 @@ void display_light_value_on_zlg7290(float value)
     digit2 = (scaled_value / 100) % 10;  // Ones digit (XX)
     digit3 = (scaled_value / 10) % 10;   // Tenths digit (YY)
     digit4 = scaled_value % 10;          // Hundredths digit (YY)
-
-    // Display mapping: _ _ D1 D2 . D3 D4 _
-    // Tx1_Buffer[2] = digit1 (tens)
-    // Tx1_Buffer[3] = digit2 (ones) + decimal point
-    // Tx1_Buffer[4] = digit3 (tenths)
-    // Tx1_Buffer[5] = digit4 (hundredths)
-
+    
+    if (g_main_loop_delay_ms == 25) {
+        gear = 1;
+    } else if (g_main_loop_delay_ms == 50) {
+        gear = 2;
+    } else if (g_main_loop_delay_ms == 75) {
+        gear = 3;
+    } else {
+        gear = 0; // Default to off if no valid delay is set
+    }
+    Tx1_Buffer[0] = segment_codes[gear]; // Display gear on DIG1 (leftmost digit)
     // Handle leading zero for values less than 10 (e.g., 05.23)
     if (digit1 == 0 && value < 10.0f) {
         Tx1_Buffer[2] = SEG_BLANK; // Or segment_codes[0] to display leading '0'
@@ -559,12 +578,6 @@ void display_light_value_on_zlg7290(float value)
     Tx1_Buffer[4] = segment_codes[digit3];          // Tenths digit
     Tx1_Buffer[5] = segment_codes[digit4];          // Hundredths digit
     
-    // Example for 3-digit display X.Y (e.g., light value 5.23 -> 5.2)
-    // scaled_value = (int)(value * 10.0f + 0.5f); // 5.23 -> 52
-    // digit1 = (scaled_value / 10) % 10; // Ones digit
-    // digit2 = scaled_value % 10;       // Tenths digit
-    // Tx1_Buffer[3] = segment_codes[digit1] | SEG_DP;
-    // Tx1_Buffer[4] = segment_codes[digit2];
 }
 
 // Function to turn on a specific marquee LED
@@ -628,8 +641,9 @@ void init() {
 
   /* USER CODE BEGIN 2 in init() - HAL_TIM_PWM_Start and HAL_ADC_Start_DMA are here */  
   CHECK_SEQUENCE(SEQ_STATE_MX_PERIPH_INIT_CALLED);
-  HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
+//   HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
   HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
+  MX_IWDG_Init();  // 添加看门狗初始化
   g_exec_sequence_state = SEQ_STATE_CUSTOM_HAL_INIT_CALLED;
   
   CHECK_SEQUENCE(SEQ_STATE_CUSTOM_HAL_INIT_CALLED); // Final check before init() returns
@@ -657,10 +671,12 @@ int main(void)
   g_fan_logic_enabled = 0;     // Explicitly set to off at start
 
   if (!is_hot_start) {
+      HAL_Delay(100); // Delay to ensure all peripherals are ready
       CHECK_SEQUENCE(SEQ_STATE_HOT_COLD_CHECK_COMPLETED);
       // Cold start: normal initialization
       Turn_Off_All_Marquee_LEDs(); // Ensure marquee LEDs are off at startup
       printf("Cold start detected\r\n");
+      HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
       for(int i=0; i<FILTER_WINDOW_SIZE; ++i) light_value_history[i] = 0.0f;
       current_sum = 0.0f;
       filter_index = 0;
@@ -724,10 +740,7 @@ int main(void)
                          // It's usually cleared after the first iteration post-hot-start.
                          // Assuming it's correctly managed.
         // Normal operation mode: read ADC values
-        temp0 = (float)adcx[0]*(3.3/4096); // ADC Channel 0
         temp1 = (float)adcx[1]*(3.3/4096); // ADC Channel 1 (e.g., light sensor)
-        temp2 = (float)adcx[2]*(3.3/4096); // ADC Channel 2
-        temp3 = (float)adcx[3]*(3.3/4096); // ADC Channel 3
         float raw_light_value_scaled = temp1*10; // Scale light sensor value (example scaling)
 
         // Apply moving average filter
@@ -784,6 +797,11 @@ int main(void)
         save_counter = 0;
     }
 
+    g_watchdog_feed_counter++;
+    if (g_watchdog_feed_counter >= WATCHDOG_FEED_INTERVAL) { // Feed watchdog every 10 iterations
+        Watchdog_Feed();
+        g_watchdog_feed_counter = 0; // Reset feed counter
+    }
     CHECK_SEQUENCE(SEQ_STATE_IN_MAIN_LOOP);
     HAL_Delay(g_main_loop_delay_ms); // Use variable delay
   }
