@@ -55,6 +55,24 @@ float temp0,temp1,temp2,temp3; // Temporary variables for sensor values
 // Variable to store the light sensor value
 float light_value;
 float servoAngle;
+
+// Hot start data structure
+#define HOT_START_FLAG 0x12345678  // Magic number to indicate hot start
+typedef struct {
+    uint32_t hot_start_flag;
+    uint32_t light_value_raw;      // Save light sensor raw data
+    uint32_t marquee_count_saved;  // Save marquee LED count
+    uint32_t buzzer_enabled_saved;    // Change from buzzer_state_saved
+    uint32_t motor_state_saved;    // Save motor state
+    uint32_t checksum;             // Simple checksum for data validation
+} HotStartData_t;
+
+// Define the backup register base address for STM32F4
+#define BACKUP_REG_BASE ((uint32_t *)0x40002850)  // STM32F4 backup register base
+HotStartData_t *hot_start_data = (HotStartData_t *)BACKUP_REG_BASE;
+
+uint8_t is_hot_start = 0;  // hot start flag
+
 #define ZLG_READ_ADDRESS1         0x01 // ZLG7290 Key value read register address
 #define ZLG_READ_ADDRESS2         0x10 // ZLG7290 Display data read start address (possibly unused)
 #define ZLG_WRITE_ADDRESS1        0x10 // ZLG7290 Display data write start address
@@ -83,7 +101,10 @@ const uint8_t segment_codes[10] = { // Segment codes for digits 0-9 for ZLG7290 
 uint8_t marquee_count = 0; // Counter for marquee LED sequence
 
 volatile uint8_t g_buzzer_should_sound = 0; // Flag to control buzzer state
+volatile uint8_t g_buzzer_enabled = 0;      // New flag for continuous buzzer control
 /* USER CODE END PV */
+
+
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -94,23 +115,166 @@ void display_light_value_on_zlg7290(float value);
 void Turn_On_Marquee_LED(uint8_t led_index); // Function to turn on a specific marquee LED
 void Turn_Off_All_Marquee_LEDs(void);    // Function to turn off all marquee LEDs
 void beer_should_sound(void); // Function to control buzzer sound state
+void save_hot_start_state(void); // Function to save hot start state
+uint8_t check_and_restore_hot_start(void); // Function to check and restore hot start state
+/* USER CODE END Private function prototypes -----------------------------------------------*/
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
 
-void beer_should_sound(void)
+// Data validation function for hot start recovery
+uint8_t validate_hot_start_data(void)
 {
-    if (g_buzzer_should_sound > 0)
-    {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_6, GPIO_PIN_SET); // Turn on buzzer
-        g_buzzer_should_sound--; // Decrement remaining ticks
+    // Validate light sensor value range (10-30 based on experiments)
+    if (light_value < 5.0f || light_value > 35.0f) {
+        printf("Hot start data validation failed: light_value=%.2f out of range\r\n", light_value);
+        return 0; // Validation failed
     }
-    else
-    {
-        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_6, GPIO_PIN_RESET); // Turn off buzzer
+    
+    // Validate servo angle range (0-180 degrees)
+    if (servoAngle < 0.0f || servoAngle > 180.0f) {
+        printf("Hot start data validation failed: servoAngle=%.2f out of range\r\n", servoAngle);
+        return 0; // Validation failed
     }
+    
+    // Validate marquee count range (0-255, but typically 0-3 for LED index)
+    if (marquee_count > 100) { // Allow some flexibility
+        printf("Hot start data validation failed: marquee_count=%d out of range\r\n", marquee_count);
+        return 0; // Validation failed
+    }
+    
+    // Validate buzzer state (should be reasonable) - check g_buzzer_enabled instead
+    if (g_buzzer_enabled > 1) { // Should be 0 or 1
+        printf("Hot start data validation failed: buzzer_enabled=%d out of range\r\n", g_buzzer_enabled);
+        return 0; // Validation failed
+    }
+    
+    // Additional consistency check: servo angle should match light value
+    float expected_servo_angle = light_value * (180.0/33.0);
+    float angle_difference = (servoAngle > expected_servo_angle) ? 
+                            (servoAngle - expected_servo_angle) : 
+                            (expected_servo_angle - servoAngle);
+    
+    if (angle_difference > 10.0f) { // Allow 10 degree tolerance
+        printf("Hot start data validation failed: servo angle inconsistent with light value\r\n");
+        return 0; // Validation failed
+    }
+    
+    printf("Hot start data validation passed\r\n");
+    return 1; // Validation passed
 }
 
+// Reset to safe default values when validation fails
+void reset_to_safe_defaults(void)
+{
+    light_value = 15.0f;    // Safe middle value
+    servoAngle = 15.0f * (180.0/33.0);
+    marquee_count = 0;
+    g_buzzer_enabled = 0;   // Changed from g_buzzer_should_sound
+    
+    printf("Reset to safe default values\r\n");
+}
+
+void save_hot_start_state(void)
+{
+    // Save the current state to backup registers
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+    
+    hot_start_data->hot_start_flag = HOT_START_FLAG;
+    
+    // Convert light_value to raw uint32_t for storage
+    union {
+        float f;
+        uint32_t u;
+    } light_converter;
+    light_converter.f = light_value;
+    hot_start_data->light_value_raw = light_converter.u;
+    
+    hot_start_data->marquee_count_saved = marquee_count;
+    hot_start_data->buzzer_enabled_saved = g_buzzer_enabled;
+    
+    // Save motor state based on light_value
+    hot_start_data->motor_state_saved = (light_value > 20.0f) ? 1 : 0;
+    
+    // Simple checksum for additional validation
+    uint32_t checksum = hot_start_data->light_value_raw + 
+                       hot_start_data->marquee_count_saved + 
+                       hot_start_data->buzzer_enabled_saved + 
+                       hot_start_data->motor_state_saved;
+    checksum = ~checksum; // Simple complement checksum
+    hot_start_data->checksum = checksum;
+    
+    HAL_PWR_DisableBkUpAccess();
+}
+
+uint8_t check_and_restore_hot_start(void)
+{
+    __HAL_RCC_PWR_CLK_ENABLE();
+    HAL_PWR_EnableBkUpAccess();
+    
+    if (hot_start_data->hot_start_flag == HOT_START_FLAG) {
+        // Verify checksum first
+        uint32_t calculated_checksum = hot_start_data->light_value_raw + 
+                                     hot_start_data->marquee_count_saved + 
+                                     hot_start_data->buzzer_enabled_saved + 
+                                     hot_start_data->motor_state_saved;
+        calculated_checksum = ~calculated_checksum;
+        
+        if (calculated_checksum != hot_start_data->checksum) {
+            printf("Hot start checksum validation failed\r\n");
+            HAL_PWR_DisableBkUpAccess();
+            return 0; // Treat as cold start
+        }
+        
+        // Hot start detected, restore the state
+        union {
+            float f;
+            uint32_t u;
+        } light_converter;
+        light_converter.u = hot_start_data->light_value_raw;
+        light_value = light_converter.f;
+        
+        marquee_count = hot_start_data->marquee_count_saved;
+        g_buzzer_enabled = hot_start_data->buzzer_enabled_saved;
+        
+        // Restore servo angle
+        servoAngle = light_value * (180.0/33.0);
+        
+        HAL_PWR_DisableBkUpAccess();
+        
+        // Validate the restored data
+        if (!validate_hot_start_data()) {
+            // Data validation failed, reset to safe defaults
+            reset_to_safe_defaults();
+            printf("Hot start data corrupted, using safe defaults\r\n");
+            return 0; // Treat as cold start due to data corruption
+        }
+        
+        return 1; // Hot start with valid data
+    }
+    
+    HAL_PWR_DisableBkUpAccess();
+    return 0; // no hot start
+}
+
+void beer_should_sound(void)
+{
+    static uint8_t buzzer_pin_state = 0; // Variable to toggle pin state
+
+    if (g_buzzer_enabled) {
+        // Toggle the pin state to generate a square wave
+        buzzer_pin_state = !buzzer_pin_state;
+        if (buzzer_pin_state) {
+            HAL_GPIO_WritePin(GPIOG, GPIO_PIN_6, GPIO_PIN_SET); // Set pin high
+        } else {
+            HAL_GPIO_WritePin(GPIOG, GPIO_PIN_6, GPIO_PIN_RESET); // Set pin low
+        }
+    } else {
+        HAL_GPIO_WritePin(GPIOG, GPIO_PIN_6, GPIO_PIN_RESET); // Ensure buzzer is off
+        buzzer_pin_state = 0; // Reset state when buzzer is disabled to ensure it starts low next time
+    }
+}
 /**
   * @brief  Converts the light value to segment codes and prepares it for ZLG7290 display.
   * @param  value: The light value as a float (e.g., 5.2368).
@@ -229,49 +393,90 @@ int main(void)
   MX_ADC3_Init();
   MX_USART1_UART_Init();
   MX_TIM12_Init(); // init PWM timer
-  /* USER CODE BEGIN 2 */
+  /* USER CODE BEGIN 2 */  
   MX_I2C1_Init();
-  HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
-  Turn_Off_All_Marquee_LEDs(); // Ensure marquee LEDs are off at startup
-  /* USER CODE END 2 */
+  
+  // Check if it's a hot start
+  is_hot_start = check_and_restore_hot_start();
+  
+  if (!is_hot_start) {
+      // Cold start: normal initialization
+      HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
+      Turn_Off_All_Marquee_LEDs(); // Ensure marquee LEDs are off at startup
+      printf("Cold start detected\r\n");
+  } else {
+      // Hot start: quickly restore state
+      HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Still need to start ADC
+      
+      // Restore device states based on saved state
+      if (light_value > 20.0f) {
+          // Restore marquee LED state
+          Turn_Off_All_Marquee_LEDs();
+          Turn_On_Marquee_LED(marquee_count % 4);
+          // Restore motor state
+          DC_Task(0x13);
+      } else {
+          Turn_Off_All_Marquee_LEDs();
+          DC_Task(0x00);
+      }
+      
+      // Restore servo position
+      SteeringEngine_Rotate(servoAngle);
+      
+      printf("Hot start detected, light_value=%.2f\r\n", light_value);
+  }
+  
+    /* USER CODE END 2 */
   HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
-  SteeringEngine_RotateFullCircle();
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+  
+  if (!is_hot_start) {
+      SteeringEngine_RotateFullCircle(); // Only execute full circle rotation on cold start
+  }
+
   while (1)
   {
   /* USER CODE END WHILE */
 
-  /* USER CODE BEGIN 3 */
-
-    temp0 = (float)adcx[0]*(3.3/4096); // ADC Channel 0
-    temp1 = (float)adcx[1]*(3.3/4096); // ADC Channel 1 (e.g., light sensor)
-    temp2 = (float)adcx[2]*(3.3/4096); // ADC Channel 2
-    temp3 = (float)adcx[3]*(3.3/4096); // ADC Channel 3
-    light_value = temp1*10; // Scale light sensor value (example scaling)
-    servoAngle = light_value * (180.0/33.0); // function to getangle
+  /* USER CODE BEGIN 3 */    
+  if (!is_hot_start) {
+        // Normal operation mode: read ADC values
+        temp0 = (float)adcx[0]*(3.3/4096); // ADC Channel 0
+        temp1 = (float)adcx[1]*(3.3/4096); // ADC Channel 1 (e.g., light sensor)
+        temp2 = (float)adcx[2]*(3.3/4096); // ADC Channel 2
+        temp3 = (float)adcx[3]*(3.3/4096); // ADC Channel 3
+        light_value = temp1*10; // Scale light sensor value (example scaling)
+        servoAngle = light_value * (180.0/33.0); // function to getangle
+    } else {
+        // First loop after hot start, use saved values, then switch to normal mode
+        is_hot_start = 0; // Clear hot start flag, run in normal mode afterwards
+    }
+    
     printf("\r Light Sensor Value =%f\r",light_value); // Print light sensor value via UART
     printf("\r\n servoAngle = %f\r\n", servoAngle); // Print servo angle
     display_light_value_on_zlg7290(light_value); // Prepare display data for ZLG7290
     // Write data from Tx1_Buffer to ZLG7290 display via I2C
     I2C_ZLG7290_Write(&hi2c1, 0x70, ZLG_WRITE_ADDRESS1, Tx1_Buffer, 8);
     SteeringEngine_Rotate(servoAngle); // Rotate steering engine based on light value
-    // Marquee LED control based on light_value
-    if (light_value > 20.0f)
+      // Marquee LED control based on light_value
+    // Note: Sensor value is opposite to actual light intensity
+    if (light_value > 20.0f)  // Actually a dark environment
     {
         Turn_Off_All_Marquee_LEDs(); // Turn off all LEDs before lighting the next one in sequence
         Turn_On_Marquee_LED(marquee_count % 4); // Turn on the current LED in sequence
         marquee_count++; // Move to the next LED for the next cycle
-        if (g_buzzer_should_sound == 0) { // If not already beeping or scheduled to beep
-            g_buzzer_should_sound = 1000;  // Set to beep for 100 SysTick interrupts (approx 100ms)
-        }
-        DC_Task(0x13); // Rotate DC motor (example command)
+        g_buzzer_enabled = 1; // Enable buzzer sound
+        DC_Task(0x13); // Rotate DC motor (example command)    
     }
-    else
+    else  // Actually a bright environment
     {
         Turn_Off_All_Marquee_LEDs(); // Turn off all marquee LEDs if light value is not greater than 20
-        g_buzzer_should_sound = 0; // Stop any ongoing/scheduled beep immediately
+        g_buzzer_enabled = 0; // Stop any ongoing/scheduled beep immediately
         DC_Task(0x00); // Stop DC motor (example command)
+    }    // Save state periodically (every few cycles)
+    static uint8_t save_counter = 0;
+    if (++save_counter >= 5) { // Save once every 5 cycles
+        save_hot_start_state();
+        save_counter = 0;
     }
 
     HAL_Delay(500); // Delay for 1 second
