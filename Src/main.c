@@ -104,6 +104,12 @@ volatile uint8_t g_buzzer_should_sound = 0; // Flag to control buzzer state
 volatile uint8_t g_buzzer_enabled = 0;      // New flag for continuous buzzer control
 /* USER CODE END PV */
 
+// Variables for Moving Average Filter
+#define FILTER_WINDOW_SIZE 10 // Size of the moving average window (e.g., 10 samples)
+static float light_value_history[FILTER_WINDOW_SIZE] = {0.0f}; // History of raw light values
+static int filter_index = 0; // Current index in the history buffer
+static float current_sum = 0.0f; // Sum of values in the history buffer
+static int num_samples_in_filter = 0; // Number of samples currently in the filter
 
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,10 +123,33 @@ void Turn_Off_All_Marquee_LEDs(void);    // Function to turn off all marquee LED
 void beer_should_sound(void); // Function to control buzzer sound state
 void save_hot_start_state(void); // Function to save hot start state
 uint8_t check_and_restore_hot_start(void); // Function to check and restore hot start state
+float apply_moving_average_filter(float raw_value); // Function to apply moving average filter
 /* USER CODE END Private function prototypes -----------------------------------------------*/
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+
+float apply_moving_average_filter(float raw_value)
+{
+    // Subtract the oldest value from sum
+    current_sum -= light_value_history[filter_index];
+    // Add new raw value to history
+    light_value_history[filter_index] = raw_value;
+    // Add new raw value to sum
+    current_sum += raw_value;
+    // Advance index (circularly)
+    filter_index = (filter_index + 1) % FILTER_WINDOW_SIZE;
+
+    if (num_samples_in_filter < FILTER_WINDOW_SIZE) {
+        num_samples_in_filter++; // Increment sample count until buffer is full
+    }
+
+    if (num_samples_in_filter > 0) {
+        return current_sum / num_samples_in_filter; // Calculate average
+    } else {
+        return raw_value; // Should ideally not happen if buffer fills
+    }
+}
 
 // Data validation function for hot start recovery
 uint8_t validate_hot_start_data(void)
@@ -404,6 +433,10 @@ int main(void)
       HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Start ADC conversion with DMA
       Turn_Off_All_Marquee_LEDs(); // Ensure marquee LEDs are off at startup
       printf("Cold start detected\r\n");
+      for(int i=0; i<FILTER_WINDOW_SIZE; ++i) light_value_history[i] = 0.0f;
+      current_sum = 0.0f;
+      filter_index = 0;
+      num_samples_in_filter = 0;
   } else {
       // Hot start: quickly restore state
       HAL_ADC_Start_DMA(&hadc3,(uint32_t*)adcx,4); // Still need to start ADC
@@ -429,14 +462,14 @@ int main(void)
     /* USER CODE END 2 */
   HAL_TIM_PWM_Start(&htim12, TIM_CHANNEL_1); 
   
-  if (!is_hot_start) {
+  if (!is_hot_start && num_samples_in_filter == 0) {
       SteeringEngine_RotateFullCircle(); // Only execute full circle rotation on cold start
   }
 
   while (1)
   {
   /* USER CODE END WHILE */
-
+  float raw_light_value_scaled;
   /* USER CODE BEGIN 3 */    
   if (!is_hot_start) {
         // Normal operation mode: read ADC values
@@ -444,10 +477,24 @@ int main(void)
         temp1 = (float)adcx[1]*(3.3/4096); // ADC Channel 1 (e.g., light sensor)
         temp2 = (float)adcx[2]*(3.3/4096); // ADC Channel 2
         temp3 = (float)adcx[3]*(3.3/4096); // ADC Channel 3
-        light_value = temp1*10; // Scale light sensor value (example scaling)
+        raw_light_value_scaled = temp1*10; // Scale light sensor value (example scaling)
+
+        // Apply moving average filter
+        light_value = apply_moving_average_filter(raw_light_value_scaled);
+
         servoAngle = light_value * (180.0/33.0); // function to getangle
     } else {
         // First loop after hot start, use saved values, then switch to normal mode
+                // Prime the filter with the restored light_value for a smooth transition.
+        for (int i = 0; i < FILTER_WINDOW_SIZE; i++) {
+            light_value_history[i] = light_value; // Use the restored light_value
+        }
+        current_sum = light_value * FILTER_WINDOW_SIZE;
+        num_samples_in_filter = FILTER_WINDOW_SIZE; // Mark filter as full
+        filter_index = 0; // Reset filter index
+        // servoAngle is already restored/recalculated in check_and_restore_hot_start or just before this loop.
+        // No need to recalculate servoAngle here as light_value hasn't changed yet from restored.
+
         is_hot_start = 0; // Clear hot start flag, run in normal mode afterwards
     }
     
