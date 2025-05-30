@@ -80,8 +80,11 @@ typedef struct {
 // Define the backup register base address for STM32F4
 #define BACKUP_REG_BASE_ADDR ((uint32_t *)0x40002850)  // STM32F4 backup register base for HotStartData_t base
 HotStartData_t *hot_start_data = (HotStartData_t *)BACKUP_REG_BASE_ADDR;
+
 // Place validation data immediately after hot_start_data in backup RAM
-HotStartValidationData_t *hot_start_validation_data = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t));
+HotStartValidationData_t *hot_start_validation_data_1 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t));
+HotStartValidationData_t *hot_start_validation_data_2 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t) + sizeof(HotStartValidationData_t));
+HotStartValidationData_t *hot_start_validation_data_3 = (HotStartValidationData_t *)((uint8_t *)BACKUP_REG_BASE_ADDR + sizeof(HotStartData_t) + sizeof(HotStartValidationData_t) + sizeof(HotStartValidationData_t));
 
 uint8_t is_hot_start = 0;  // hot start flag
 
@@ -359,12 +362,24 @@ void save_hot_start_state(void)
     hot_start_data->checksum = ~checksum;
 
     // Populate validation data (+1 for each field)
-    hot_start_validation_data->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
-    hot_start_validation_data->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
-    hot_start_validation_data->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
-    hot_start_validation_data->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
-    hot_start_validation_data->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
-    
+    hot_start_validation_data_1->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
+    hot_start_validation_data_1->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
+    hot_start_validation_data_1->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
+    hot_start_validation_data_1->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
+    hot_start_validation_data_1->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
+    // Populate validation data 2 (+1 for each field)
+    hot_start_validation_data_2->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
+    hot_start_validation_data_2->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
+    hot_start_validation_data_2->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
+    hot_start_validation_data_2->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
+    hot_start_validation_data_2->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
+
+    // Populate validation data 3 (+1 for each field)
+    hot_start_validation_data_3->validation_flag = HOT_START_VALIDATION_FLAG_VALUE;
+    hot_start_validation_data_3->light_value_raw_plus_one = hot_start_data->light_value_raw + 1;
+    hot_start_validation_data_3->marquee_count_saved_plus_one = hot_start_data->marquee_count_saved + 1;
+    hot_start_validation_data_3->buzzer_enabled_saved_plus_one = hot_start_data->buzzer_enabled_saved + 1;
+    hot_start_validation_data_3->motor_state_saved_plus_one = hot_start_data->motor_state_saved + 1;
     HAL_PWR_DisableBkUpAccess();
 }
 
@@ -379,15 +394,8 @@ uint8_t check_and_restore_hot_start(void)
         HAL_PWR_DisableBkUpAccess();
         return 0; // No valid primary hot start data
     }
-
-    // 2. Check validation data flag
-    if (hot_start_validation_data->validation_flag != HOT_START_VALIDATION_FLAG_VALUE) {
-        printf("Hot start validation flag invalid or not set.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0; // No valid validation data
-    }
         
-    // 3. Verify checksum for main data
+    // 2. Verify checksum for main data
     uint32_t calculated_checksum = hot_start_data->light_value_raw + 
                                  hot_start_data->marquee_count_saved + 
                                  hot_start_data->buzzer_enabled_saved + 
@@ -395,34 +403,69 @@ uint8_t check_and_restore_hot_start(void)
     calculated_checksum = ~calculated_checksum;
     
     if (calculated_checksum != hot_start_data->checksum) {
-        printf("Hot start checksum validation failed.\r\n");
+        printf("Hot start checksum validation failed for main data.\r\n");
         HAL_PWR_DisableBkUpAccess();
         return 0; // Treat as cold start
     }
     
-    // 4. Perform the new +1 validation
-    if ((hot_start_data->light_value_raw + 1) != hot_start_validation_data->light_value_raw_plus_one) {
-        printf("Hot start +1 validation failed for light_value_raw.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0;
-    }
-    if ((hot_start_data->marquee_count_saved + 1) != hot_start_validation_data->marquee_count_saved_plus_one) {
-        printf("Hot start +1 validation failed for marquee_count_saved.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0;
-    }
-    if ((hot_start_data->buzzer_enabled_saved + 1) != hot_start_validation_data->buzzer_enabled_saved_plus_one) {
-        printf("Hot start +1 validation failed for buzzer_enabled_saved.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0;
-    }
-    if ((hot_start_data->motor_state_saved + 1) != hot_start_validation_data->motor_state_saved_plus_one) {
-        printf("Hot start +1 validation failed for motor_state_saved.\r\n");
-        HAL_PWR_DisableBkUpAccess();
-        return 0;
+    uint8_t successful_validations = 0;
+
+    // 3. Perform validation for backup set 1
+    if (hot_start_validation_data_1->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
+        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_1->light_value_raw_plus_one &&
+            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_1->marquee_count_saved_plus_one &&
+            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_1->buzzer_enabled_saved_plus_one &&
+            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_1->motor_state_saved_plus_one) {
+            successful_validations++;
+            printf("Validation set 1 passed.\r\n");
+        } else {
+            printf("Validation set 1: +1 data mismatch.\r\n");
+        }
+    } else {
+        printf("Validation set 1: flag invalid.\r\n");
     }
 
-    // All checks passed, restore the state from main hot start data
+    // 4. Perform validation for backup set 2
+    if (hot_start_validation_data_2->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
+        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_2->light_value_raw_plus_one &&
+            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_2->marquee_count_saved_plus_one &&
+            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_2->buzzer_enabled_saved_plus_one &&
+            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_2->motor_state_saved_plus_one) {
+            successful_validations++;
+            printf("Validation set 2 passed.\r\n");
+        } else {
+            printf("Validation set 2: +1 data mismatch.\r\n");
+        }
+    } else {
+        printf("Validation set 2: flag invalid.\r\n");
+    }
+
+    // 5. Perform validation for backup set 3
+    if (hot_start_validation_data_3->validation_flag == HOT_START_VALIDATION_FLAG_VALUE) {
+        if ((hot_start_data->light_value_raw + 1) == hot_start_validation_data_3->light_value_raw_plus_one &&
+            (hot_start_data->marquee_count_saved + 1) == hot_start_validation_data_3->marquee_count_saved_plus_one &&
+            (hot_start_data->buzzer_enabled_saved + 1) == hot_start_validation_data_3->buzzer_enabled_saved_plus_one &&
+            (hot_start_data->motor_state_saved + 1) == hot_start_validation_data_3->motor_state_saved_plus_one) {
+            successful_validations++;
+            printf("Validation set 3 passed.\r\n");
+        } else {
+            printf("Validation set 3: +1 data mismatch.\r\n");
+        }
+    } else {
+        printf("Validation set 3: flag invalid.\r\n");
+    }
+
+    printf("Total successful backup validations: %d\r\n", successful_validations);
+
+    // 6. Majority Vote
+    if (successful_validations < 2) {
+        printf("Hot start majority vote failed (need at least 2 valid backup sets).\r\n");
+        HAL_PWR_DisableBkUpAccess();
+        return 0; // Treat as cold start
+    }
+    printf("Hot start majority vote passed.\r\n");
+
+    // All primary checks and majority vote passed, restore the state from main hot start data
     union {
         float f;
         uint32_t u;
@@ -436,7 +479,7 @@ uint8_t check_and_restore_hot_start(void)
     // Restore servo angle (derived from light_value)
     servoAngle = light_value * (180.0/33.0); 
 
-    // 5. Validate the restored data semantically (existing function)
+    // 7. Validate the restored data semantically (existing function)
     if (!validate_hot_start_data()) {
         // Data validation failed, reset to safe defaults
         reset_to_safe_defaults();
